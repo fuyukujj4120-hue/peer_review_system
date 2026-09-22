@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import hmac
 import math
@@ -12,6 +13,7 @@ import gspread
 import pandas as pd
 import streamlit as st
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError
 
 
 st.set_page_config(
@@ -22,6 +24,10 @@ st.set_page_config(
 
 TZ = ZoneInfo("Asia/Taipei")
 REVIEW_SECONDS = 10 * 60
+
+# 每張工作表最多每 20 秒讀取一次。
+# 快取由所有 Streamlit 使用者共用。
+SHEET_CACHE_SECONDS = 20
 
 HEADERS = {
     "roster": [
@@ -83,97 +89,284 @@ HEADERS = {
 }
 
 
+class GoogleSheetStore:
+    """
+    Google 試算表共用資料層。
+
+    所有 Streamlit 使用者共用同一份記憶體快取。
+    同一張工作表在快取期限內只會向 Google API 讀取一次。
+    """
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.cache = {}
+
+        credentials = Credentials.from_service_account_info(
+            dict(st.secrets["gcp_service_account"]),
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ],
+        )
+
+        client = gspread.authorize(credentials)
+
+        self.spreadsheet = client.open_by_key(
+            st.secrets["spreadsheet_id"]
+        )
+
+        existing = {
+            worksheet.title: worksheet
+            for worksheet in self.spreadsheet.worksheets()
+        }
+
+        self.worksheets = {}
+
+        for sheet_name, headers in HEADERS.items():
+            worksheet = existing.get(sheet_name)
+
+            if worksheet is None:
+                worksheet = self.spreadsheet.add_worksheet(
+                    title=sheet_name,
+                    rows=2000,
+                    cols=max(len(headers), 10),
+                )
+
+                worksheet.update(
+                    range_name="A1",
+                    values=[headers],
+                )
+
+            else:
+                current_headers = worksheet.row_values(1)
+
+                if not current_headers:
+                    worksheet.update(
+                        range_name="A1",
+                        values=[headers],
+                    )
+
+                elif current_headers != headers:
+                    raise ValueError(
+                        f"Google 試算表的「{sheet_name}」"
+                        f"第一列欄位不符合目前程式。\n\n"
+                        f"目前欄位：{current_headers}\n\n"
+                        f"正確欄位：{headers}\n\n"
+                        f"若這張工作表沒有正式資料，"
+                        f"請刪除後重新啟動網站。"
+                    )
+
+            self.worksheets[sheet_name] = worksheet
+
+    def _status_code(self, error):
+        response = getattr(error, "response", None)
+
+        return getattr(
+            response,
+            "status_code",
+            None,
+        )
+
+    def _read_google_values(self, sheet_name):
+        """
+        遇到 429 或 Google 暫時性錯誤時自動重試。
+        """
+
+        worksheet = self.worksheets[sheet_name]
+        last_error = None
+
+        for attempt in range(5):
+            try:
+                return worksheet.get_all_values()
+
+            except APIError as error:
+                last_error = error
+                status_code = self._status_code(error)
+
+                if status_code not in {
+                    429,
+                    500,
+                    502,
+                    503,
+                    504,
+                }:
+                    raise
+
+                if attempt == 4:
+                    break
+
+                time.sleep(min(2 ** attempt, 8))
+
+        raise last_error
+
+    def _parse_values(self, values):
+        if len(values) <= 1:
+            return []
+
+        headers = values[0]
+        output = []
+
+        for row in values[1:]:
+            padded = (
+                row
+                + [""] * (
+                    len(headers)
+                    - len(row)
+                )
+            )
+
+            output.append(
+                dict(
+                    zip(
+                        headers,
+                        padded,
+                    )
+                )
+            )
+
+        return output
+
+    def read(self, sheet_name):
+        """
+        同一張工作表在 20 秒內只讀取一次 Google API。
+
+        使用 RLock 避免 33 人同時快取失效時，
+        產生 33 次相同的 API 請求。
+        """
+
+        with self.lock:
+            now = time.monotonic()
+            cached = self.cache.get(sheet_name)
+
+            if cached is not None:
+                age = now - cached["loaded_at"]
+
+                if age < SHEET_CACHE_SECONDS:
+                    return copy.deepcopy(
+                        cached["records"]
+                    )
+
+            values = self._read_google_values(
+                sheet_name
+            )
+
+            parsed = self._parse_values(
+                values
+            )
+
+            self.cache[sheet_name] = {
+                "loaded_at": now,
+                "records": parsed,
+            }
+
+            return copy.deepcopy(parsed)
+
+    def append(self, sheet_name, data):
+        """
+        新增資料後直接同步更新記憶體快取，
+        不重新讀取整張 Google 試算表。
+        """
+
+        with self.lock:
+            headers = HEADERS[sheet_name]
+
+            normalized = {
+                column: str(
+                    data.get(column, "")
+                )
+                for column in headers
+            }
+
+            self.worksheets[
+                sheet_name
+            ].append_row(
+                [
+                    normalized[column]
+                    for column in headers
+                ],
+                value_input_option="RAW",
+            )
+
+            cached = self.cache.get(sheet_name)
+
+            if cached is not None:
+                cached["records"].append(
+                    copy.deepcopy(normalized)
+                )
+
+    def update(
+        self,
+        sheet_name,
+        row_number,
+        data,
+    ):
+        """
+        更新資料後直接同步修改記憶體快取。
+        """
+
+        with self.lock:
+            headers = HEADERS[sheet_name]
+
+            normalized = {
+                column: str(
+                    data.get(column, "")
+                )
+                for column in headers
+            }
+
+            self.worksheets[
+                sheet_name
+            ].update(
+                range_name=f"A{row_number}",
+                values=[
+                    [
+                        normalized[column]
+                        for column in headers
+                    ]
+                ],
+            )
+
+            cached = self.cache.get(sheet_name)
+
+            cache_index = row_number - 2
+
+            if (
+                cached is not None
+                and 0
+                <= cache_index
+                < len(cached["records"])
+            ):
+                cached["records"][
+                    cache_index
+                ] = copy.deepcopy(normalized)
+
+
 @st.cache_resource
 def connect_store():
-    credentials = Credentials.from_service_account_info(
-        dict(st.secrets["gcp_service_account"]),
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
-
-    spreadsheet = gspread.authorize(credentials).open_by_key(
-        st.secrets["spreadsheet_id"]
-    )
-
-    existing = {
-        worksheet.title: worksheet
-        for worksheet in spreadsheet.worksheets()
-    }
-
-    worksheets = {}
-
-    for sheet_name, headers in HEADERS.items():
-        worksheet = existing.get(sheet_name)
-
-        if worksheet is None:
-            worksheet = spreadsheet.add_worksheet(
-                title=sheet_name,
-                rows=2000,
-                cols=max(len(headers), 10),
-            )
-
-            worksheet.update(
-                range_name="A1",
-                values=[headers],
-            )
-
-        elif not worksheet.row_values(1):
-            worksheet.update(
-                range_name="A1",
-                values=[headers],
-            )
-
-        elif worksheet.row_values(1) != headers:
-            raise ValueError(
-                f"Google 試算表的「{sheet_name}」第一列欄位不符合程式。"
-                f"若尚無正式資料，請刪除該工作表後重新啟動網站。"
-            )
-
-        worksheets[sheet_name] = worksheet
-
-    return worksheets, threading.RLock()
+    return GoogleSheetStore()
 
 
-SHEETS, DATA_LOCK = connect_store()
+STORE = connect_store()
+DATA_LOCK = STORE.lock
 
 
 def records(sheet_name):
-    values = SHEETS[sheet_name].get_all_values()
-
-    if len(values) <= 1:
-        return []
-
-    headers = values[0]
-    output = []
-
-    for row in values[1:]:
-        padded = row + [""] * (len(headers) - len(row))
-        output.append(dict(zip(headers, padded)))
-
-    return output
+    return STORE.read(sheet_name)
 
 
 def append_record(sheet_name, data):
-    SHEETS[sheet_name].append_row(
-        [
-            str(data.get(column, ""))
-            for column in HEADERS[sheet_name]
-        ],
-        value_input_option="RAW",
-    )
+    STORE.append(sheet_name, data)
 
 
-def update_record(sheet_name, row_number, data):
-    SHEETS[sheet_name].update(
-        range_name=f"A{row_number}",
-        values=[
-            [
-                str(data.get(column, ""))
-                for column in HEADERS[sheet_name]
-            ]
-        ],
+def update_record(
+    sheet_name,
+    row_number,
+    data,
+):
+    STORE.update(
+        sheet_name,
+        row_number,
+        data,
     )
 
 
@@ -203,22 +396,38 @@ def password_hash(password, salt=None):
     return f"{salt}${digest}"
 
 
-def password_matches(password, stored_hash):
+def password_matches(
+    password,
+    stored_hash,
+):
     try:
-        salt, _ = stored_hash.split("$", 1)
+        salt, _ = stored_hash.split(
+            "$",
+            1,
+        )
+
+        calculated = password_hash(
+            password,
+            salt,
+        )
 
         return hmac.compare_digest(
-            password_hash(password, salt),
+            calculated,
             stored_hash,
         )
 
-    except (ValueError, TypeError):
+    except (
+        ValueError,
+        TypeError,
+    ):
         return False
 
 
 def roster_map():
     return {
-        row["student_id"].strip(): row["name"].strip()
+        row["student_id"].strip(): (
+            row["name"].strip()
+        )
         for row in records("roster")
         if row["student_id"].strip()
         and row["name"].strip()
@@ -239,7 +448,9 @@ def schedule_rows():
             )
 
             order = int(row["order"])
-            student_id = row["student_id"].strip()
+            student_id = (
+                row["student_id"].strip()
+            )
 
         except (
             ValueError,
@@ -272,14 +483,14 @@ def recommended_date(dates):
         TZ
     ).date().isoformat()
 
-    arrived_dates = [
+    arrived = [
         date
         for date in dates
         if date <= today
     ]
 
-    if arrived_dates:
-        return max(arrived_dates)
+    if arrived:
+        return max(arrived)
 
     return min(dates)
 
@@ -304,17 +515,17 @@ def session_is_active(session):
 
 
 def active_session():
-    active_sessions = [
+    active = [
         row
         for row in records("sessions")
         if session_is_active(row)
     ]
 
-    if not active_sessions:
+    if not active:
         return None
 
     return max(
-        active_sessions,
+        active,
         key=lambda row: float(
             row["started_at"]
         ),
@@ -325,7 +536,10 @@ def session_finished(session):
     return not session_is_active(session)
 
 
-def start_session(date, presenter_id):
+def start_session(
+    date,
+    presenter_id,
+):
     with DATA_LOCK:
         if active_session():
             raise ValueError(
@@ -374,8 +588,10 @@ def start_session(date, presenter_id):
 
 def close_session(session_id):
     with DATA_LOCK:
+        sessions = records("sessions")
+
         for row_number, session in enumerate(
-            records("sessions"),
+            sessions,
             start=2,
         ):
             if session["session_id"] == session_id:
@@ -404,7 +620,7 @@ def register_student(
 
     if password != confirmation:
         raise ValueError(
-            "兩次密碼不一致。"
+            "兩次輸入的密碼不一致。"
         )
 
     if len(password) < 4:
@@ -416,16 +632,16 @@ def register_student(
 
     if student_id not in roster:
         raise ValueError(
-            "學號不在學生名單中。"
+            "這個學號不在學生名單中。"
         )
 
     with DATA_LOCK:
-        existing_user = any(
-            row["student_id"] == student_id
-            for row in records("users")
-        )
+        users = records("users")
 
-        if existing_user:
+        if any(
+            row["student_id"] == student_id
+            for row in users
+        ):
             raise ValueError(
                 "這個學號已註冊，請直接登入。"
             )
@@ -443,7 +659,10 @@ def register_student(
         )
 
 
-def login_student(student_id, password):
+def login_student(
+    student_id,
+    password,
+):
     student_id = student_id.strip()
 
     user = next(
@@ -481,7 +700,9 @@ def student_authentication():
 
     with login_tab:
         with st.form("student_login"):
-            student_id = st.text_input("學號")
+            student_id = st.text_input(
+                "學號"
+            )
 
             password = st.text_input(
                 "密碼",
@@ -502,8 +723,13 @@ def student_authentication():
                     password,
                 )
 
-                st.session_state["user"] = user
-                st.session_state["role"] = "student"
+                st.session_state[
+                    "user"
+                ] = user
+
+                st.session_state[
+                    "role"
+                ] = "student"
 
                 st.rerun()
 
@@ -576,9 +802,11 @@ def submit_review(
             None,
         )
 
+        # 在實際寫入前使用伺服器時間檢查，
+        # 不受畫面更新速度或快取影響。
         if not session_is_active(session):
             raise ValueError(
-                "互評尚未開始或時間已結束。"
+                "互評時間已結束，無法提交。"
             )
 
         if (
@@ -674,9 +902,7 @@ def student_review_panel():
     )
 
     if submitted:
-        st.success(
-            "本場互評已提交。"
-        )
+        st.success("本場互評已提交。")
         return
 
     with st.form(
@@ -692,18 +918,20 @@ def student_review_panel():
         comment = st.text_area(
             "評語",
             placeholder=(
-                "請填寫優點、改善建議"
+                "請填寫報告優點、改善建議"
                 "或想提問的內容。"
             ),
             max_chars=1000,
         )
 
-        send = st.form_submit_button(
-            "提交互評",
-            type="primary",
+        submitted_button = (
+            st.form_submit_button(
+                "提交互評",
+                type="primary",
+            )
         )
 
-    if send:
+    if submitted_button:
         try:
             submit_review(
                 session["session_id"],
@@ -833,7 +1061,7 @@ def student_results():
         for row in records("reviews")
     }
 
-    my_review_grades = []
+    review_grade_rows = []
 
     for row in records("review_grades"):
         if row["reviewer_id"] != student_id:
@@ -847,10 +1075,10 @@ def student_results():
             {},
         )
 
-        my_review_grades.append({
+        review_grade_rows.append({
             "報告日期": row["date"],
             "報告者姓名": row["presenter_name"],
-            "我給的互評分數": (
+            "我的互評分數": (
                 original_review.get(
                     "score",
                     "",
@@ -868,7 +1096,7 @@ def student_results():
         })
 
     show_export(
-        my_review_grades,
+        review_grade_rows,
         "我的互評內容成績.csv",
         "my_review_content_grades",
     )
@@ -1075,18 +1303,18 @@ def session_selector(key):
         for row in sessions
     }
 
-    session_id = st.selectbox(
+    selected_id = st.selectbox(
         "選擇場次",
         list(session_map),
-        format_func=lambda value: (
+        format_func=lambda session_id: (
             session_label(
-                session_map[value]
+                session_map[session_id]
             )
         ),
         key=key,
     )
 
-    return session_map[session_id]
+    return session_map[selected_id]
 
 
 def admin_review_records():
@@ -1150,7 +1378,7 @@ def save_presentation_grade(
     grade,
     feedback,
 ):
-    grade_data = {
+    data = {
         "session_id": session["session_id"],
         "date": session["date"],
         "presenter_id": session["presenter_id"],
@@ -1172,14 +1400,14 @@ def save_presentation_grade(
                 update_record(
                     "grades",
                     row_number,
-                    grade_data,
+                    data,
                 )
 
                 return
 
         append_record(
             "grades",
-            grade_data,
+            data,
         )
 
 
@@ -1188,7 +1416,7 @@ def save_review_grade(
     review_grade,
     review_feedback,
 ):
-    grade_data = {
+    data = {
         "session_id": review["session_id"],
         "date": review["date"],
         "reviewer_id": review["reviewer_id"],
@@ -1218,14 +1446,14 @@ def save_review_grade(
                 update_record(
                     "review_grades",
                     row_number,
-                    grade_data,
+                    data,
                 )
 
                 return
 
         append_record(
             "review_grades",
-            grade_data,
+            data,
         )
 
 
@@ -1245,7 +1473,7 @@ def presentation_grading_panel():
         f"{selected_session['presenter_id']}"
     )
 
-    existing_grade = next(
+    existing = next(
         (
             row
             for row in records("grades")
@@ -1258,24 +1486,24 @@ def presentation_grading_panel():
     with st.form(
         "presentation_grade_form"
     ):
-        presentation_grade = st.number_input(
+        grade = st.number_input(
             "報告成績",
             min_value=0.0,
             max_value=100.0,
             value=(
-                float(existing_grade["grade"])
-                if existing_grade
-                and existing_grade["grade"]
+                float(existing["grade"])
+                if existing
+                and existing["grade"]
                 else 0.0
             ),
             step=1.0,
         )
 
-        presentation_feedback = st.text_area(
+        feedback = st.text_area(
             "報告回饋",
             value=(
-                existing_grade["feedback"]
-                if existing_grade
+                existing["feedback"]
+                if existing
                 else ""
             ),
             max_chars=1000,
@@ -1291,8 +1519,8 @@ def presentation_grading_panel():
     if submitted:
         save_presentation_grade(
             selected_session,
-            presentation_grade,
-            presentation_feedback,
+            grade,
+            feedback,
         )
 
         st.success("報告成績已儲存。")
@@ -1300,7 +1528,7 @@ def presentation_grading_panel():
 
     st.subheader("全部報告成績")
 
-    all_presentation_grades = [
+    grade_rows = [
         {
             "報告日期": row["date"],
             "報告者學號": row["presenter_id"],
@@ -1313,7 +1541,7 @@ def presentation_grading_panel():
     ]
 
     show_export(
-        all_presentation_grades,
+        grade_rows,
         "全學期報告成績.csv",
         "all_presentation_grades",
     )
@@ -1323,7 +1551,7 @@ def review_content_grading_panel():
     st.subheader("每位學生的互評內容評分")
 
     selected_session = session_selector(
-        "review_content_grading_session"
+        "review_grading_session"
     )
 
     if selected_session is None:
@@ -1342,36 +1570,34 @@ def review_content_grading_panel():
         )
         return
 
-    reviewer_options = {
+    review_map = {
         row["reviewer_id"]: row
         for row in session_reviews
     }
 
-    selected_reviewer_id = st.selectbox(
-        "選擇要評分的互評者",
-        list(reviewer_options),
+    reviewer_id = st.selectbox(
+        "選擇互評者",
+        list(review_map),
         format_func=lambda student_id: (
-            f"{reviewer_options[student_id]['reviewer_name']}｜"
+            f"{review_map[student_id]['reviewer_name']}｜"
             f"{student_id}"
         ),
     )
 
-    selected_review = reviewer_options[
-        selected_reviewer_id
+    selected_review = review_map[
+        reviewer_id
     ]
-
-    st.markdown("#### 學生提交的互評")
-
-    st.write(
-        f"互評者："
-        f"{selected_review['reviewer_name']}｜"
-        f"{selected_review['reviewer_id']}"
-    )
 
     st.write(
         f"報告者："
         f"{selected_review['presenter_name']}｜"
         f"{selected_review['presenter_id']}"
+    )
+
+    st.write(
+        f"互評者："
+        f"{selected_review['reviewer_name']}｜"
+        f"{selected_review['reviewer_id']}"
     )
 
     st.write(
@@ -1386,10 +1612,12 @@ def review_content_grading_panel():
         height=150,
     )
 
-    existing_review_grade = next(
+    existing = next(
         (
             row
-            for row in records("review_grades")
+            for row in records(
+                "review_grades"
+            )
             if row["session_id"]
             == selected_review["session_id"]
             and row["reviewer_id"]
@@ -1399,7 +1627,7 @@ def review_content_grading_panel():
     )
 
     form_key = (
-        f"review_grade_form_"
+        f"review_grade_"
         f"{selected_review['session_id']}_"
         f"{selected_review['reviewer_id']}"
     )
@@ -1411,12 +1639,12 @@ def review_content_grading_panel():
             max_value=100.0,
             value=(
                 float(
-                    existing_review_grade[
+                    existing[
                         "review_grade"
                     ]
                 )
-                if existing_review_grade
-                and existing_review_grade[
+                if existing
+                and existing[
                     "review_grade"
                 ]
                 else 0.0
@@ -1427,10 +1655,10 @@ def review_content_grading_panel():
         review_feedback = st.text_area(
             "對互評內容的回饋",
             value=(
-                existing_review_grade[
+                existing[
                     "review_feedback"
                 ]
-                if existing_review_grade
+                if existing
                 else ""
             ),
             max_chars=1000,
@@ -1470,7 +1698,9 @@ def review_content_grading_panel():
             "管理員回饋": row["review_feedback"],
             "更新時間": row["updated_at"],
         }
-        for row in records("review_grades")
+        for row in records(
+            "review_grades"
+        )
     ]
 
     show_export(
