@@ -39,7 +39,6 @@ st.markdown(
 
 TZ = ZoneInfo("Asia/Taipei")
 REVIEW_SECONDS = 10 * 60
-# 修改 Google 試算表欄位或新增工作表時遞增，避免沿用舊的連線快取。
 STORE_SCHEMA_VERSION = 3
 
 HEADERS = {
@@ -91,7 +90,7 @@ HEADERS = {
 
 
 def api_call(operation, attempts=6):
-    """針對 Google API 暫時性錯誤進行指數退避重試。"""
+    """Google API 暫時性錯誤會自動重試，避免配額尖峰直接讓網站中斷。"""
     for attempt in range(attempts):
         try:
             return operation()
@@ -102,8 +101,96 @@ def api_call(operation, attempts=6):
             time.sleep(min(2 ** attempt, 16))
 
 
+def review_grade_score(row):
+    """相容舊版 review_grades 的分數欄位名稱。"""
+    for key in (
+        "teacher_score",
+        "grade",
+        "score",
+        "review_grade",
+        "content_grade",
+    ):
+        value = row.get(key, "")
+        if value != "":
+            return value
+    return "0"
+
+
+def review_grade_feedback(row):
+    """相容舊版 review_grades 的回饋欄位名稱。"""
+    for key in (
+        "teacher_feedback",
+        "feedback",
+        "review_feedback",
+        "content_feedback",
+    ):
+        value = row.get(key, "")
+        if value != "":
+            return value
+    return ""
+
+
+def migrate_review_grades_sheet(worksheet, new_headers):
+    """保留既有資料，將舊版 review_grades 欄位轉為目前欄位。"""
+    current_headers = api_call(lambda: worksheet.row_values(1))
+    if current_headers == new_headers:
+        return
+
+    values = api_call(worksheet.get_all_values)
+    if len(values) <= 1:
+        api_call(lambda: worksheet.update(range_name="A1", values=[new_headers]))
+        return
+
+    old_headers = values[0]
+    aliases = {
+        "teacher_score": [
+            "teacher_score",
+            "grade",
+            "score",
+            "review_grade",
+            "content_grade",
+        ],
+        "teacher_feedback": [
+            "teacher_feedback",
+            "feedback",
+            "review_feedback",
+            "content_feedback",
+        ],
+    }
+
+    migrated_rows = []
+    for source_row in values[1:]:
+        padded = source_row + [""] * (len(old_headers) - len(source_row))
+        old_record = dict(zip(old_headers, padded))
+        migrated = []
+        for position, column in enumerate(new_headers):
+            candidates = aliases.get(column, [column])
+            value = next(
+                (
+                    old_record[candidate]
+                    for candidate in candidates
+                    if candidate in old_record
+                    and old_record[candidate] != ""
+                ),
+                "",
+            )
+            # 舊版只改過欄位名稱時，仍可依原欄位位置保留資料。
+            if value == "" and position < len(source_row):
+                value = source_row[position]
+            migrated.append(value)
+        migrated_rows.append(migrated)
+
+    api_call(
+        lambda: worksheet.update(
+            range_name="A1",
+            values=[new_headers, *migrated_rows],
+        )
+    )
+
+
 @st.cache_resource
 def connect_store(schema_version):
+    # schema_version 用來讓 Streamlit 在新增工作表後放棄舊的資源快取。
     del schema_version
     credentials = Credentials.from_service_account_info(
         dict(st.secrets["gcp_service_account"]),
@@ -137,6 +224,8 @@ def connect_store(schema_version):
                     values=[columns],
                 )
             )
+        elif sheet_name == "review_grades":
+            migrate_review_grades_sheet(worksheet, headers)
         sheets[sheet_name] = worksheet
 
     return spreadsheet, sheets, threading.RLock()
@@ -159,7 +248,7 @@ except gspread.exceptions.APIError as error:
 
 
 def ensure_sheet(sheet_name):
-    """確保工作表存在，也修復舊 cache_resource 缺少新工作表的情況。"""
+    """避免舊 cache_resource 中沒有 review_grades 而產生 KeyError。"""
     if sheet_name in SHEETS:
         return SHEETS[sheet_name]
 
@@ -599,8 +688,8 @@ def student_results():
         {
             "報告日期": row["date"],
             "報告者姓名": row["presenter_name"],
-            "老師分數": row["teacher_score"],
-            "老師回饋": row["teacher_feedback"],
+            "老師分數": review_grade_score(row),
+            "老師回饋": review_grade_feedback(row),
             "更新時間": row["updated_at"],
         }
         for row in records("review_grades")
@@ -902,12 +991,12 @@ def admin_review_grading():
             "老師給互評內容的分數",
             min_value=0.0,
             max_value=100.0,
-            value=float(existing["teacher_score"]) if existing else 0.0,
+            value=float(review_grade_score(existing)) if existing else 0.0,
             step=1.0,
         )
         teacher_feedback = st.text_area(
             "老師給互評內容的回饋",
-            value=existing["teacher_feedback"] if existing else "",
+            value=review_grade_feedback(existing) if existing else "",
             max_chars=1000,
         )
         submitted = st.form_submit_button(
@@ -926,8 +1015,8 @@ def admin_review_grading():
             "報告者姓名": row["presenter_name"],
             "互評者學號": row["reviewer_id"],
             "互評者姓名": row["reviewer_name"],
-            "老師分數": row["teacher_score"],
-            "老師回饋": row["teacher_feedback"],
+            "老師分數": review_grade_score(row),
+            "老師回饋": review_grade_feedback(row),
             "更新時間": row["updated_at"],
         }
         for row in records("review_grades")
@@ -1040,4 +1129,5 @@ def main():
 
 
 main()
+
 
