@@ -39,6 +39,8 @@ st.markdown(
 
 TZ = ZoneInfo("Asia/Taipei")
 REVIEW_SECONDS = 10 * 60
+# 修改 Google 試算表欄位或新增工作表時遞增，避免沿用舊的連線快取。
+STORE_SCHEMA_VERSION = 3
 
 HEADERS = {
     "roster": ["student_id", "name"],
@@ -88,46 +90,8 @@ HEADERS = {
 }
 
 
-@st.cache_resource
-def connect_store():
-    credentials = Credentials.from_service_account_info(
-        dict(st.secrets["gcp_service_account"]),
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
-    )
-    spreadsheet = gspread.authorize(credentials).open_by_key(
-        st.secrets["spreadsheet_id"]
-    )
-    existing = {sheet.title: sheet for sheet in spreadsheet.worksheets()}
-    sheets = {}
-
-    for sheet_name, headers in HEADERS.items():
-        worksheet = existing.get(sheet_name)
-        if worksheet is None:
-            worksheet = spreadsheet.add_worksheet(
-                title=sheet_name,
-                rows=2000,
-                cols=max(len(headers), 10),
-            )
-            worksheet.update(range_name="A1", values=[headers])
-        elif not worksheet.row_values(1):
-            worksheet.update(range_name="A1", values=[headers])
-        elif worksheet.row_values(1) != headers:
-            raise ValueError(
-                f"Google 試算表的「{sheet_name}」第一列欄位不符合新版程式。"
-                f"若尚無正式資料，請刪除該工作表後重新啟動網站。"
-            )
-        sheets[sheet_name] = worksheet
-
-    return sheets, threading.RLock()
-
-
-SHEETS, DATA_LOCK = connect_store()
-
-
-def api_call(operation, attempts=5):
+def api_call(operation, attempts=6):
+    """針對 Google API 暫時性錯誤進行指數退避重試。"""
     for attempt in range(attempts):
         try:
             return operation()
@@ -135,13 +99,107 @@ def api_call(operation, attempts=5):
             status = getattr(getattr(error, "response", None), "status_code", 0)
             if status not in (429, 500, 502, 503, 504) or attempt == attempts - 1:
                 raise
-            time.sleep(min(2 ** attempt, 8))
+            time.sleep(min(2 ** attempt, 16))
+
+
+@st.cache_resource
+def connect_store(schema_version):
+    del schema_version
+    credentials = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]),
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
+    client = gspread.authorize(credentials)
+    spreadsheet = api_call(
+        lambda: client.open_by_key(st.secrets["spreadsheet_id"])
+    )
+    sheets = {
+        sheet.title: sheet
+        for sheet in api_call(spreadsheet.worksheets)
+    }
+
+    for sheet_name, headers in HEADERS.items():
+        worksheet = sheets.get(sheet_name)
+        if worksheet is None:
+            worksheet = api_call(
+                lambda name=sheet_name, columns=headers: spreadsheet.add_worksheet(
+                    title=name,
+                    rows=2000,
+                    cols=max(len(columns), 10),
+                )
+            )
+            api_call(
+                lambda target=worksheet, columns=headers: target.update(
+                    range_name="A1",
+                    values=[columns],
+                )
+            )
+        sheets[sheet_name] = worksheet
+
+    return spreadsheet, sheets, threading.RLock()
+
+
+try:
+    SPREADSHEET, SHEETS, DATA_LOCK = connect_store(STORE_SCHEMA_VERSION)
+except gspread.exceptions.APIError as error:
+    status = getattr(getattr(error, "response", None), "status_code", 0)
+    if status in (401, 403):
+        st.error(
+            "Google 試算表授權失敗。請確認試算表已分享給 Secrets 中的服務帳號 email。"
+        )
+    else:
+        st.error(
+            "目前無法連線到 Google 試算表，可能是 API 配額暫時用完或 Google 服務忙碌。"
+            "請等待約 1 分鐘後重新整理頁面。"
+        )
+    st.stop()
+
+
+def ensure_sheet(sheet_name):
+    """確保工作表存在，也修復舊 cache_resource 缺少新工作表的情況。"""
+    if sheet_name in SHEETS:
+        return SHEETS[sheet_name]
+
+    with DATA_LOCK:
+        if sheet_name in SHEETS:
+            return SHEETS[sheet_name]
+
+        headers = HEADERS[sheet_name]
+        existing = {
+            sheet.title: sheet
+            for sheet in api_call(SPREADSHEET.worksheets)
+        }
+        worksheet = existing.get(sheet_name)
+        if worksheet is None:
+            worksheet = api_call(
+                lambda: SPREADSHEET.add_worksheet(
+                    title=sheet_name,
+                    rows=2000,
+                    cols=max(len(headers), 10),
+                )
+            )
+            api_call(lambda: worksheet.update(range_name="A1", values=[headers]))
+        else:
+            first_row = api_call(lambda: worksheet.row_values(1))
+            if not first_row:
+                api_call(lambda: worksheet.update(range_name="A1", values=[headers]))
+            elif first_row != headers:
+                raise ValueError(
+                    f"Google 試算表的「{sheet_name}」第一列欄位不符合新版程式。"
+                )
+
+        SHEETS[sheet_name] = worksheet
+        return worksheet
 
 
 @st.cache_data(ttl=20, show_spinner=False)
 def records(sheet_name):
     with DATA_LOCK:
-        values = api_call(lambda: SHEETS[sheet_name].get_all_values())
+        worksheet = ensure_sheet(sheet_name)
+        values = api_call(worksheet.get_all_values)
     if len(values) <= 1:
         return []
     headers = values[0]
@@ -153,8 +211,9 @@ def records(sheet_name):
 
 
 def append_record(sheet_name, data):
+    worksheet = ensure_sheet(sheet_name)
     api_call(
-        lambda: SHEETS[sheet_name].append_row(
+        lambda: worksheet.append_row(
             [str(data.get(column, "")) for column in HEADERS[sheet_name]],
             value_input_option="RAW",
         )
@@ -163,8 +222,9 @@ def append_record(sheet_name, data):
 
 
 def update_record(sheet_name, row_number, data):
+    worksheet = ensure_sheet(sheet_name)
     api_call(
-        lambda: SHEETS[sheet_name].update(
+        lambda: worksheet.update(
             range_name=f"A{row_number}",
             values=[
                 [str(data.get(column, "")) for column in HEADERS[sheet_name]]
@@ -980,4 +1040,3 @@ def main():
 
 
 main()
-
