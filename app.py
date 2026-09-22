@@ -20,10 +20,164 @@ st.set_page_config(
     layout="wide",
 )
 
-# 讓老師查看學生互評內容時，停用的文字框仍以黑色顯示。
+# 全站視覺美化（僅調整外觀，不影響任何功能與資料內容）。
 st.markdown(
     """
     <style>
+    @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;600;700;900&display=swap');
+
+    :root {
+        --brand-1: #6C5CE7;
+        --brand-2: #8E7BFF;
+        --brand-3: #00C2A8;
+        --ink: #1F2430;
+        --muted: #6B7280;
+        --card-bg: #FFFFFF;
+        --card-border: rgba(108, 92, 231, 0.14);
+        --shadow: 0 4px 18px rgba(31, 36, 48, 0.06);
+    }
+
+    html, body, [class*="css"] {
+        font-family: 'Noto Sans TC', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+    }
+
+    /* 整體背景：柔和漸層，避免死板的純白 */
+    [data-testid="stAppViewContainer"] {
+        background: radial-gradient(1200px 600px at 10% -10%, #F3F1FF 0%, rgba(243,241,255,0) 60%),
+                    radial-gradient(1000px 500px at 100% 0%, #E8FBF7 0%, rgba(232,251,247,0) 55%),
+                    #FAFAFC;
+    }
+
+    [data-testid="stHeader"] {
+        background: rgba(255, 255, 255, 0.0);
+    }
+
+    .block-container {
+        padding-top: 2.2rem;
+        max-width: 1180px;
+    }
+
+    /* 標題群組 */
+    h1 {
+        color: var(--ink) !important;
+        font-weight: 900 !important;
+        letter-spacing: 0.02em;
+        padding-bottom: 0.3rem;
+        border-bottom: 4px solid transparent;
+        border-image: linear-gradient(90deg, var(--brand-1), var(--brand-3)) 1;
+        margin-bottom: 1.1rem !important;
+    }
+
+    h2 {
+        color: var(--ink) !important;
+        font-weight: 700 !important;
+        border-left: 6px solid var(--brand-1);
+        padding-left: 0.6rem;
+        margin-top: 1.4rem !important;
+    }
+
+    h3 {
+        color: var(--ink) !important;
+        font-weight: 600 !important;
+        position: relative;
+        padding-left: 0.9rem;
+    }
+    h3::before {
+        content: "";
+        position: absolute;
+        left: 0;
+        top: 0.35em;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--brand-3);
+    }
+
+    /* 側邊欄 */
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #2A2356 0%, #362B7A 100%);
+    }
+    section[data-testid="stSidebar"] * {
+        color: #F1EEFF !important;
+    }
+    section[data-testid="stSidebar"] div[role="radiogroup"] label {
+        background: rgba(255, 255, 255, 0.06);
+        border-radius: 10px;
+        padding: 0.5rem 0.75rem;
+        margin-bottom: 0.35rem;
+        transition: background 0.15s ease, transform 0.1s ease;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    section[data-testid="stSidebar"] div[role="radiogroup"] label:hover {
+        background: rgba(255, 255, 255, 0.14);
+        transform: translateX(2px);
+    }
+    section[data-testid="stSidebar"] button {
+        background: rgba(255, 255, 255, 0.1) !important;
+        border: 1px solid rgba(255, 255, 255, 0.25) !important;
+        color: #FFFFFF !important;
+        border-radius: 10px !important;
+    }
+    section[data-testid="stSidebar"] button:hover {
+        background: rgba(255, 255, 255, 0.22) !important;
+    }
+
+    /* 表單卡片化 */
+    div[data-testid="stForm"] {
+        background: var(--card-bg);
+        border: 1px solid var(--card-border);
+        border-radius: 16px;
+        padding: 1.4rem 1.4rem 0.8rem 1.4rem;
+        box-shadow: var(--shadow);
+    }
+
+    /* 分頁 Tabs */
+    button[data-baseweb="tab"] {
+        font-weight: 600;
+        border-radius: 10px 10px 0 0 !important;
+    }
+    div[data-baseweb="tab-highlight"] {
+        background-color: var(--brand-1) !important;
+        height: 3px !important;
+    }
+
+    /* 一般按鈕 */
+    .stButton > button, .stDownloadButton > button {
+        border-radius: 10px !important;
+        border: 1px solid var(--card-border) !important;
+        font-weight: 600 !important;
+        transition: transform 0.1s ease, box-shadow 0.15s ease !important;
+        box-shadow: 0 2px 8px rgba(31, 36, 48, 0.05);
+    }
+    .stButton > button:hover, .stDownloadButton > button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 6px 16px rgba(108, 92, 231, 0.18);
+    }
+    button[kind="primary"], button[kind="primaryFormSubmit"] {
+        background: linear-gradient(90deg, var(--brand-1), var(--brand-2)) !important;
+        border: none !important;
+        color: #FFFFFF !important;
+    }
+    button[kind="primary"]:hover, button[kind="primaryFormSubmit"]:hover {
+        filter: brightness(1.05);
+    }
+
+    /* 輸入元件 */
+    div[data-testid="stTextInput"] input,
+    div[data-testid="stNumberInput"] input,
+    div[data-testid="stTextArea"] textarea,
+    div[data-baseweb="select"] > div {
+        border-radius: 10px !important;
+        border-color: var(--card-border) !important;
+    }
+    div[data-testid="stTextInput"] input:focus,
+    div[data-testid="stNumberInput"] input:focus,
+    div[data-testid="stTextArea"] textarea:focus {
+        border-color: var(--brand-1) !important;
+        box-shadow: 0 0 0 2px rgba(108, 92, 231, 0.15) !important;
+    }
+
+    /* 讓老師查看學生互評內容時，停用的文字框仍以黑色顯示。 */
     div[data-testid="stTextArea"] label,
     div[data-testid="stTextArea"] label p,
     div[data-testid="stTextArea"] textarea,
@@ -31,6 +185,42 @@ st.markdown(
         color: #000000 !important;
         -webkit-text-fill-color: #000000 !important;
         opacity: 1 !important;
+    }
+
+    /* 提示訊息（info / success / warning / error）*/
+    div[data-testid="stAlert"] {
+        border-radius: 12px !important;
+        box-shadow: var(--shadow);
+        border-left-width: 6px !important;
+        border-left-style: solid !important;
+        font-weight: 500;
+    }
+
+    /* 表格 / DataFrame */
+    div[data-testid="stDataFrame"] {
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: var(--shadow);
+        border: 1px solid var(--card-border);
+    }
+
+    /* 摺疊分隔線 */
+    hr {
+        border-color: var(--card-border) !important;
+    }
+
+    /* Caption 文字 */
+    .stCaption, [data-testid="stCaptionContainer"] {
+        color: var(--muted) !important;
+    }
+
+    /* Checkbox / Slider 強調色 */
+    div[data-testid="stCheckbox"] label span[aria-checked="true"] {
+        background-color: var(--brand-1) !important;
+        border-color: var(--brand-1) !important;
+    }
+    div[data-baseweb="slider"] div[role="slider"] {
+        background-color: var(--brand-1) !important;
     }
     </style>
     """,
@@ -1129,5 +1319,4 @@ def main():
 
 
 main()
-
 
