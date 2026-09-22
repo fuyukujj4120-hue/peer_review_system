@@ -39,8 +39,6 @@ st.markdown(
 
 TZ = ZoneInfo("Asia/Taipei")
 REVIEW_SECONDS = 10 * 60
-# 修改 Google 試算表欄位或新增工作表時遞增，避免沿用舊的連線快取。
-STORE_SCHEMA_VERSION = 2
 
 HEADERS = {
     "roster": ["student_id", "name"],
@@ -91,8 +89,7 @@ HEADERS = {
 
 
 @st.cache_resource
-def connect_store(schema_version):
-    del schema_version
+def connect_store():
     credentials = Credentials.from_service_account_info(
         dict(st.secrets["gcp_service_account"]),
         scopes=[
@@ -127,7 +124,7 @@ def connect_store(schema_version):
     return sheets, threading.RLock()
 
 
-SHEETS, DATA_LOCK = connect_store(STORE_SCHEMA_VERSION)
+SHEETS, DATA_LOCK = connect_store()
 
 
 def api_call(operation, attempts=5):
