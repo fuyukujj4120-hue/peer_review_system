@@ -668,33 +668,6 @@ def extend_session(session_id, extra_minutes):
     raise ValueError("找不到互評場次。")
 
 
-def register_student(student_id, password, confirmation):
-    student_id = student_id.strip()
-    if not student_id:
-        raise ValueError("請輸入學號。")
-    if password != confirmation:
-        raise ValueError("兩次密碼不一致。")
-    if len(password) < 4:
-        raise ValueError("密碼至少需要 4 個字元。")
-
-    roster = roster_map()
-    if student_id not in roster:
-        raise ValueError("學號不在學生名單中。")
-
-    with DATA_LOCK:
-        if any(row["student_id"] == student_id for row in records("users")):
-            raise ValueError("這個學號已註冊，請直接登入。")
-        append_record(
-            "users",
-            {
-                "student_id": student_id,
-                "name": roster[student_id],
-                "password_hash": password_hash(password),
-                "created_at": now_text(),
-            },
-        )
-
-
 def login_student(student_id, password):
     student_id = student_id.strip()
     user = next(
@@ -728,35 +701,17 @@ def change_student_password(current_password, new_password, confirmation):
 
 
 def student_authentication():
-    login_tab, register_tab = st.tabs(["學生登入", "首次註冊"])
-
-    with login_tab:
-        with st.form("student_login"):
-            student_id = st.text_input("學號")
-            password = st.text_input("密碼", type="password")
-            submitted = st.form_submit_button("登入", type="primary")
-        if submitted:
-            try:
-                st.session_state["user"] = login_student(student_id, password)
-                st.session_state["role"] = "student"
-                st.rerun()
-            except ValueError as error:
-                st.error(str(error))
-
-    with register_tab:
-        with st.form("student_registration"):
-            student_id = st.text_input("學號", key="register_id")
-            password = st.text_input("自設密碼", type="password", key="register_pw")
-            confirmation = st.text_input(
-                "再次輸入密碼", type="password", key="register_confirm"
-            )
-            submitted = st.form_submit_button("完成註冊", type="primary")
-        if submitted:
-            try:
-                register_student(student_id, password, confirmation)
-                st.success("註冊完成，請切換至學生登入。")
-            except ValueError as error:
-                st.error(str(error))
+    with st.form("student_login"):
+        student_id = st.text_input("學號")
+        password = st.text_input("密碼", type="password")
+        submitted = st.form_submit_button("登入", type="primary")
+    if submitted:
+        try:
+            st.session_state["user"] = login_student(student_id, password)
+            st.session_state["role"] = "student"
+            st.rerun()
+        except ValueError as error:
+            st.error(str(error))
 
 
 def submit_review(session_id, comment):
@@ -1420,4 +1375,3 @@ def main():
 
 
 main()
-
