@@ -1168,7 +1168,6 @@ def admin_review_grading():
         f"互評者：{selected_review['reviewer_name']}｜"
         f"{selected_review['reviewer_id']}"
     )
-    st.write(f"學生給報告者的分數：{selected_review['score']} 分")
     st.text_area(
         "學生填寫的互評內容",
         value=selected_review["comment"],
