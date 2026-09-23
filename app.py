@@ -719,7 +719,7 @@ def student_authentication():
                 st.error(str(error))
 
 
-def submit_review(session_id, score, comment):
+def submit_review(session_id, comment):
     reviewer = st.session_state["user"]
     comment = comment.strip()
     if not comment:
@@ -745,7 +745,7 @@ def submit_review(session_id, score, comment):
             "reviewer_name": reviewer["name"],
             "presenter_id": session["presenter_id"],
             "presenter_name": session["presenter_name"],
-            "score": score,
+            "score": "",
             "comment": comment,
             "submitted_at": now_text(),
         }
@@ -794,12 +794,6 @@ def student_review_panel():
         st.success("本場互評已提交；倒數結束前仍可修改並重新儲存。")
 
     with st.form(f"review_{session['session_id']}"):
-        score = st.slider(
-            "整體評分",
-            1,
-            5,
-            int(existing_review["score"]) if existing_review else 3,
-        )
         comment = st.text_area(
             "評語",
             value=existing_review["comment"] if existing_review else "",
@@ -812,7 +806,7 @@ def student_review_panel():
         )
     if send:
         try:
-            result = submit_review(session["session_id"], score, comment)
+            result = submit_review(session["session_id"], comment)
             st.success("互評已更新。" if result == "updated" else "互評已提交。")
             st.rerun()
         except ValueError as error:
@@ -852,7 +846,6 @@ def student_results():
                     "報告日期": review["date"],
                     "評價者學號": review["reviewer_id"],
                     "評價者姓名": review["reviewer_name"],
-                    "互評分數": review["score"],
                     "評語": review["comment"],
                     "提交時間": review["submitted_at"],
                 }
@@ -890,6 +883,26 @@ def student_results():
         "我的互評內容評分.csv",
         "my_review_grades",
     )
+
+
+def student_review_history():
+    student_id = st.session_state["user"]["student_id"]
+    history = [
+        {
+            "報告日期": row["date"],
+            "報告者學號": row["presenter_id"],
+            "報告者姓名": row["presenter_name"],
+            "我填寫的互評內容": row["comment"],
+            "提交／更新時間": row["submitted_at"],
+        }
+        for row in records("reviews")
+        if row["reviewer_id"] == student_id
+    ]
+    history.sort(key=lambda row: row["提交／更新時間"], reverse=True)
+    if history:
+        st.dataframe(pd.DataFrame(history), hide_index=True, use_container_width=True)
+    else:
+        st.info("目前沒有過往互評紀錄。")
 
 
 def admin_login():
@@ -1010,7 +1023,6 @@ def admin_review_records():
             "報告者姓名": row["presenter_name"],
             "評價者學號": row["reviewer_id"],
             "評價者姓名": row["reviewer_name"],
-            "互評分數": row["score"],
             "評語": row["comment"],
             "提交時間": row["submitted_at"],
         }
@@ -1027,7 +1039,6 @@ def admin_review_records():
             "報告者姓名": row["presenter_name"],
             "評價者學號": row["reviewer_id"],
             "評價者姓名": row["reviewer_name"],
-            "互評分數": row["score"],
             "評語": row["comment"],
             "提交時間": row["submitted_at"],
         }
@@ -1268,13 +1279,19 @@ def admin_page():
 def student_page():
     user = st.session_state["user"]
     st.sidebar.write(f"{user['name']}｜{user['student_id']}")
-    page = st.sidebar.radio("學生功能", ["進行互評", "我的互評結果", "報告順序"])
+    page = st.sidebar.radio(
+        "學生功能",
+        ["進行互評", "我的互評結果", "我過往填寫的互評", "報告順序"],
+    )
     if page == "進行互評":
         st.title("進行互評")
         student_review_panel()
     elif page == "我的互評結果":
         st.title("我的互評結果")
         student_results()
+    elif page == "我過往填寫的互評":
+        st.title("我過往填寫的互評")
+        student_review_history()
     else:
         st.title("報告順序")
         display = [
