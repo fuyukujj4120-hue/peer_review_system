@@ -649,6 +649,25 @@ def close_session(session_id):
     raise ValueError("找不到互評場次。")
 
 
+def extend_session(session_id, extra_minutes):
+    extra_minutes = int(extra_minutes)
+    if extra_minutes < 1:
+        raise ValueError("延長時間至少需要 1 分鐘。")
+
+    with DATA_LOCK:
+        for row_number, session in enumerate(records("sessions"), start=2):
+            if session["session_id"] != session_id:
+                continue
+            if not session_is_active(session):
+                raise ValueError("這個互評場次已結束，無法延長。")
+            session["ends_at"] = str(
+                float(session["ends_at"]) + extra_minutes * 60
+            )
+            update_record("sessions", row_number, session)
+            return
+    raise ValueError("找不到互評場次。")
+
+
 def register_student(student_id, password, confirmation):
     student_id = student_id.strip()
     if not student_id:
@@ -685,6 +704,27 @@ def login_student(student_id, password):
     if user is None or not password_matches(password, user["password_hash"]):
         raise ValueError("學號或密碼錯誤。")
     return {"student_id": user["student_id"], "name": user["name"]}
+
+
+def change_student_password(current_password, new_password, confirmation):
+    if new_password != confirmation:
+        raise ValueError("兩次輸入的新密碼不一致。")
+    if len(new_password) < 4:
+        raise ValueError("新密碼至少需要 4 個字元。")
+    if current_password == new_password:
+        raise ValueError("新密碼不可與目前密碼相同。")
+
+    student_id = st.session_state["user"]["student_id"]
+    with DATA_LOCK:
+        for row_number, user in enumerate(records("users"), start=2):
+            if user["student_id"] != student_id:
+                continue
+            if not password_matches(current_password, user["password_hash"]):
+                raise ValueError("目前密碼錯誤。")
+            user["password_hash"] = password_hash(new_password)
+            update_record("users", row_number, user)
+            return
+    raise ValueError("找不到這個學生帳號。")
 
 
 def student_authentication():
@@ -905,6 +945,24 @@ def student_review_history():
         st.info("目前沒有過往互評紀錄。")
 
 
+def student_change_password():
+    with st.form("student_change_password"):
+        current_password = st.text_input("目前密碼", type="password")
+        new_password = st.text_input("新密碼", type="password")
+        confirmation = st.text_input("再次輸入新密碼", type="password")
+        submitted = st.form_submit_button("更改密碼", type="primary")
+    if submitted:
+        try:
+            change_student_password(
+                current_password,
+                new_password,
+                confirmation,
+            )
+            st.success("密碼已更改，下次登入請使用新密碼。")
+        except ValueError as error:
+            st.error(str(error))
+
+
 def admin_login():
     with st.form("admin_login"):
         password = st.text_input("老師密碼", type="password")
@@ -936,11 +994,28 @@ def admin_timer():
 
 def admin_session_control():
     st.header("場次控制")
-    st.write("每次只開放一位報告者，時間固定為 10 分鐘。")
+    st.write("每次只開放一位報告者，預設時間為 10 分鐘。")
     admin_timer()
 
     current = active_session()
     if current:
+        st.subheader("延長互評時間")
+        extra_minutes = st.number_input(
+            "延長幾分鐘",
+            min_value=1,
+            max_value=60,
+            value=5,
+            step=1,
+        )
+        if st.button("確認延長時間", type="primary"):
+            try:
+                extend_session(current["session_id"], extra_minutes)
+                st.success(f"已延長 {int(extra_minutes)} 分鐘。")
+                st.rerun()
+            except ValueError as error:
+                st.error(str(error))
+
+        st.divider()
         confirm = st.checkbox("確認提前結束目前互評")
         if st.button("提前結束", disabled=not confirm):
             close_session(current["session_id"])
@@ -1168,6 +1243,7 @@ def admin_review_grading():
         f"互評者：{selected_review['reviewer_name']}｜"
         f"{selected_review['reviewer_id']}"
     )
+    st.write(f"學生給報告者的分數：{selected_review['score']} 分")
     st.text_area(
         "學生填寫的互評內容",
         value=selected_review["comment"],
@@ -1280,7 +1356,13 @@ def student_page():
     st.sidebar.write(f"{user['name']}｜{user['student_id']}")
     page = st.sidebar.radio(
         "學生功能",
-        ["進行互評", "我的互評結果", "我過往填寫的互評", "報告順序"],
+        [
+            "進行互評",
+            "我的互評結果",
+            "我過往填寫的互評",
+            "報告順序",
+            "更改密碼",
+        ],
     )
     if page == "進行互評":
         st.title("進行互評")
@@ -1291,7 +1373,7 @@ def student_page():
     elif page == "我過往填寫的互評":
         st.title("我過往填寫的互評")
         student_review_history()
-    else:
+    elif page == "報告順序":
         st.title("報告順序")
         display = [
             {
@@ -1306,6 +1388,9 @@ def student_page():
             st.dataframe(pd.DataFrame(display), hide_index=True, use_container_width=True)
         else:
             st.info("尚未設定報告順序。")
+    else:
+        st.title("更改密碼")
+        student_change_password()
 
 
 def main():
