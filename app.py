@@ -1,6 +1,9 @@
 import hashlib
 import hmac
 import math
+import random
+import logging
+import requests
 import secrets
 import threading
 import time
@@ -229,7 +232,7 @@ st.markdown(
 
 TZ = ZoneInfo("Asia/Taipei")
 REVIEW_SECONDS = 10 * 60
-STORE_SCHEMA_VERSION = 3
+STORE_SCHEMA_VERSION = 4
 
 HEADERS = {
     "roster": ["student_id", "name"],
@@ -279,16 +282,33 @@ HEADERS = {
 }
 
 
-def api_call(operation, attempts=6):
-    """Google API 暫時性錯誤會自動重試，避免配額尖峰直接讓網站中斷。"""
+@st.cache_resource
+def api_runtime():
+    return {"lock": threading.RLock(), "last_call": 0.0}
+
+
+def api_call(operation, attempts=5):
+    """全使用者共用節流；寫入均為指定儲存格更新，可安全重試同一範圍。"""
+    runtime = api_runtime()
     for attempt in range(attempts):
         try:
-            return operation()
+            with runtime["lock"]:
+                delay = 1.1 - (time.monotonic() - runtime["last_call"])
+                if delay > 0:
+                    time.sleep(delay)
+                runtime["last_call"] = time.monotonic()
+                return operation()
         except gspread.exceptions.APIError as error:
             status = getattr(getattr(error, "response", None), "status_code", 0)
-            if status not in (429, 500, 502, 503, 504) or attempt == attempts - 1:
-                raise
-            time.sleep(min(2 ** attempt, 16))
+            if status not in (429, 500, 502, 503, 504):
+                logging.exception("Google Sheets request failed")
+                raise ValueError("試算表存取失敗，請通知管理者檢查權限與伺服器紀錄。") from error
+            if attempt == attempts - 1:
+                raise ValueError("試算表忙碌，尚未確認儲存成功；請保留評語，稍後重新提交。") from error
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as error:
+            if attempt == attempts - 1:
+                raise ValueError("連線中斷，尚未確認儲存成功；請保留評語，稍後重新提交。") from error
+        time.sleep(min(2 ** attempt, 16) + random.uniform(0, 1))
 
 
 def review_grade_score(row):
@@ -415,7 +435,7 @@ def connect_store(schema_version):
                 )
             )
         elif sheet_name == "review_grades":
-            migrate_review_grades_sheet(worksheet, headers)
+            pass  # 舊欄位須先備份後人工遷移；啟動時不覆寫既有資料。
         sheets[sheet_name] = worksheet
 
     return spreadsheet, sheets, threading.RLock()
@@ -423,6 +443,9 @@ def connect_store(schema_version):
 
 try:
     SPREADSHEET, SHEETS, DATA_LOCK = connect_store(STORE_SCHEMA_VERSION)
+except ValueError as error:
+    st.error(str(error))
+    st.stop()
 except gspread.exceptions.APIError as error:
     status = getattr(getattr(error, "response", None), "status_code", 0)
     if status in (401, 403):
@@ -474,43 +497,74 @@ def ensure_sheet(sheet_name):
         return worksheet
 
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_resource
+def record_cache():
+    return {}
+
+
+def read_checked(sheet_name):
+    worksheet = ensure_sheet(sheet_name)
+    values = api_call(worksheet.get_all_values)
+    headers = HEADERS[sheet_name]
+    if not values or values[0][:len(headers)] != headers:
+        raise ValueError(f"工作表 {sheet_name} 標題不符，請先備份並修正欄位，系統不會自動覆寫。")
+    for number, row in enumerate(values, start=1):
+        if any(str(v).strip() for v in row[len(headers):]):
+            raise ValueError(f"工作表 {sheet_name} 第 {number} 列超出預期欄位，請先修復錯位資料。")
+        if number > 1 and any(str(v).strip() for v in row) and not str(row[0]).strip():
+            raise ValueError(f"工作表 {sheet_name} 第 {number} 列缺少識別值，請先修復資料。")
+    return values
+
+
 def records(sheet_name):
+    # 快取與資料鎖使用一致的鎖順序，避免多人提交時互相等待快取鎖。
     with DATA_LOCK:
-        worksheet = ensure_sheet(sheet_name)
-        values = api_call(worksheet.get_all_values)
-    if len(values) <= 1:
-        return []
-    headers = values[0]
-    output = []
-    for row in values[1:]:
-        padded = row + [""] * (len(headers) - len(row))
-        output.append(dict(zip(headers, padded)))
-    return output
+        cached = record_cache().get(sheet_name)
+        if cached and time.monotonic() - cached[0] < 20:
+            return [dict(row) for row in cached[1]]
+        values = read_checked(sheet_name)
+        headers = HEADERS[sheet_name]
+        result = [dict(zip(headers, row + [""] * (len(headers) - len(row))))
+                  for row in values[1:]]  # 保留空白列的位置，更新列號不偏移。
+        record_cache()[sheet_name] = (time.monotonic(), result)
+        return [dict(row) for row in result]
+
+
+def clear_records(sheet_name=None):
+    with DATA_LOCK:
+        if sheet_name is None:
+            record_cache().clear()
+        else:
+            record_cache().pop(sheet_name, None)
+
+
+records.clear = clear_records
 
 
 def append_record(sheet_name, data):
-    worksheet = ensure_sheet(sheet_name)
-    api_call(
-        lambda: worksheet.append_row(
-            [str(data.get(column, "")) for column in HEADERS[sheet_name]],
-            value_input_option="RAW",
-        )
-    )
-    records.clear()
+    # 完全不使用 append 的自動表格偵測，明確從 A 欄寫入下一列。
+    # 限單一 app 執行個體，且上課期間不得手動排序、刪列或另開寫入程式。
+    with DATA_LOCK:
+        values = read_checked(sheet_name)
+        update_record(sheet_name, len(values) + 1, data)
 
 
 def update_record(sheet_name, row_number, data):
-    worksheet = ensure_sheet(sheet_name)
-    api_call(
-        lambda: worksheet.update(
-            range_name=f"A{row_number}",
-            values=[
-                [str(data.get(column, "")) for column in HEADERS[sheet_name]]
-            ],
-        )
-    )
-    records.clear()
+    with DATA_LOCK:
+        headers = HEADERS[sheet_name]
+        worksheet = ensure_sheet(sheet_name)
+        last_column = gspread.utils.rowcol_to_a1(1, len(headers)).rstrip("1")
+        if row_number < 2:
+            raise ValueError("拒絕覆寫標題列。")
+        if row_number > worksheet.row_count:
+            api_call(lambda: worksheet.resize(rows=max(row_number, worksheet.row_count + 1000)))
+        payload = [[str(data.get(column, "")) for column in headers]]
+        try:
+            api_call(lambda: worksheet.update(
+                range_name=f"A{row_number}:{last_column}{row_number}",
+                values=payload, value_input_option="RAW"))
+        finally:
+            records.clear(sheet_name)
 
 
 def now_text():
@@ -689,6 +743,7 @@ def change_student_password(current_password, new_password, confirmation):
 
     student_id = st.session_state["user"]["student_id"]
     with DATA_LOCK:
+        records.clear("users")
         for row_number, user in enumerate(records("users"), start=2):
             if user["student_id"] != student_id:
                 continue
@@ -715,12 +770,16 @@ def student_authentication():
 
 
 def submit_review(session_id, comment):
+    submitted_at = time.time()
     reviewer = st.session_state["user"]
     comment = comment.strip()
     if not comment:
         raise ValueError("請輸入評語。")
 
     with DATA_LOCK:
+        records.clear("reviews")
+        records.clear("sessions")
+        # 以點擊送出時間驗證，避免排隊期間超時。
         session = next(
             (
                 row
@@ -729,7 +788,7 @@ def submit_review(session_id, comment):
             ),
             None,
         )
-        if not session_is_active(session):
+        if not session or session.get("status") != "OPEN" or submitted_at >= float(session["ends_at"]):
             raise ValueError("互評尚未開始或時間已結束。")
         if reviewer["student_id"] == session["presenter_id"]:
             raise ValueError("報告者不能評價自己。")
@@ -801,7 +860,8 @@ def student_review_panel():
         )
     if send:
         try:
-            result = submit_review(session["session_id"], comment)
+            with st.spinner("正在排隊儲存，請勿重複點擊或關閉頁面…"):
+                result = submit_review(session["session_id"], comment)
             st.success("互評已更新。" if result == "updated" else "互評已提交。")
             st.rerun()
         except ValueError as error:
