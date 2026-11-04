@@ -769,8 +769,67 @@ def student_authentication():
             st.error(str(error))
 
 
-def submit_review(session_id, comment):
+@st.cache_resource
+def submission_queue():
+    # 僅供同一執行個體共用。資料鎖與佇列鎖不交叉持有。
+    return {"lock": threading.RLock(), "items": [], "active": None}
+
+
+def queue_snapshot(session_id=None):
+    queue = submission_queue()
+    with queue["lock"]:
+        items = [item for item in queue["items"]
+                 if session_id is None or item["session_id"] == session_id]
+        active = queue["active"]
+        return {
+            "waiting": sum(item["ticket"] != active for item in items),
+            "processing": int(any(item["ticket"] == active for item in items)),
+        }
+
+
+def submit_review_queued(session_id, comment):
+    comment = comment.strip()
+    if not comment:
+        raise ValueError("請輸入評語。")
+    queue = submission_queue()
+    ticket = uuid.uuid4().hex
+    student_id = st.session_state["user"]["student_id"]
     submitted_at = time.time()
+    with queue["lock"]:
+        if any(item["session_id"] == session_id and item["student_id"] == student_id
+               for item in queue["items"]):
+            raise ValueError("你的上一筆提交仍在處理，請等待原頁面顯示結果。")
+        queue["items"].append({"ticket": ticket, "session_id": session_id,
+                               "student_id": student_id})
+    message = st.empty()
+    try:
+        while True:
+            with queue["lock"]:
+                index = next(i for i, item in enumerate(queue["items"])
+                             if item["ticket"] == ticket)
+                if index == 0 and queue["active"] is None:
+                    queue["active"] = ticket
+                    ready = True
+                else:
+                    ready = False
+            if ready:
+                break
+            message.info(f"⏳ 等待儲存中，你前面還有 {index} 人。請保持頁面開啟。")
+            time.sleep(0.5)
+        message.info("💾 正在處理你的提交，確認寫入成功後會顯示結果。")
+        result = submit_review(session_id, comment, submitted_at=submitted_at)
+        message.success("✅ 儲存成功。")
+        return result
+    finally:
+        # 含錯誤與 Streamlit 中斷，均釋放順位，避免下一位永遠等候。
+        with queue["lock"]:
+            queue["items"][:] = [item for item in queue["items"] if item["ticket"] != ticket]
+            if queue["active"] == ticket:
+                queue["active"] = None
+
+
+def submit_review(session_id, comment, submitted_at=None):
+    submitted_at = time.time() if submitted_at is None else submitted_at
     reviewer = st.session_state["user"]
     comment = comment.strip()
     if not comment:
@@ -860,8 +919,7 @@ def student_review_panel():
         )
     if send:
         try:
-            with st.spinner("正在排隊儲存，請勿重複點擊或關閉頁面…"):
-                result = submit_review(session["session_id"], comment)
+            result = submit_review_queued(session["session_id"], comment)
             st.success("互評已更新。" if result == "updated" else "互評已提交。")
             st.rerun()
         except ValueError as error:
@@ -990,21 +1048,42 @@ def admin_login():
             st.error("老師密碼錯誤。")
 
 
-@st.fragment(run_every="5s")
+@st.fragment(run_every="2s")
 def admin_timer():
-    session = active_session()
-    if not session:
-        st.info("目前沒有進行中的互評。")
+    stats = queue_snapshot()
+    st.info(f"等待處理：{stats['waiting']} 人｜正在處理：{stats['processing']} 人")
+    # 提交期間只讀記憶體快照，不等待資料鎖或新增 Google API 請求。
+    cached_sessions = record_cache().get("sessions")
+    cached_reviews = record_cache().get("reviews")
+    if DATA_LOCK.acquire(blocking=False):
+        try:
+            if not cached_sessions or time.monotonic() - cached_sessions[0] >= 20:
+                records("sessions")
+            if not cached_reviews or time.monotonic() - cached_reviews[0] >= 20:
+                records("reviews")
+            cached_sessions = record_cache().get("sessions")
+            cached_reviews = record_cache().get("reviews")
+            st.session_state["admin_timer_sessions"] = cached_sessions
+            st.session_state["admin_timer_reviews"] = cached_reviews
+        except ValueError as error:
+            st.warning(str(error))
+        finally:
+            DATA_LOCK.release()
+    cached_sessions = cached_sessions or st.session_state.get("admin_timer_sessions")
+    cached_reviews = cached_reviews or st.session_state.get("admin_timer_reviews")
+    sessions = cached_sessions[1] if cached_sessions else []
+    active = [row for row in sessions if session_is_active(row)]
+    if not active:
+        st.caption("目前沒有進行中的互評；排隊數包含所有場次。")
         return
+    session = max(active, key=lambda row: float(row["started_at"]))
     remaining = max(0, math.ceil(float(session["ends_at"]) - time.time()))
-    review_count = sum(
-        row["session_id"] == session["session_id"] for row in records("reviews")
-    )
-    st.warning(
-        f"互評中：{session['presenter_name']}｜"
-        f"剩餘 {remaining // 60:02d}:{remaining % 60:02d}｜"
-        f"已收到 {review_count} 份"
-    )
+    reviews = cached_reviews[1] if cached_reviews else []
+    count = len({row["reviewer_id"] for row in reviews
+                 if row.get("session_id") == session["session_id"]})
+    st.progress(min(1.0, remaining / max(1.0, float(session["ends_at"]) - float(session["started_at"]))),
+                text=f"{session['presenter_name']}｜剩餘 {remaining // 60:02d}:{remaining % 60:02d}")
+    st.caption(f"已儲存：{count} 人（最近一次查詢結果，約每 20 秒更新；忙碌時延後）")
 
 
 def admin_session_control():
